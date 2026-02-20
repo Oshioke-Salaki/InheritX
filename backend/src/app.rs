@@ -1,99 +1,148 @@
 use axum::{
-    middleware,
+    extract::{Path, State},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
-use deadpool_postgres::Pool;
+use serde_json::{json, Value};
+use sqlx::PgPool;
 use std::sync::Arc;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use uuid::Uuid;
 
-use crate::{
-    config::Config,
-    http::{
-        admin, auth, health, identity, payments, transfers, withdrawals,
-    },
-    middleware::{auth as auth_middleware, metrics, request_id},
-    service::ServiceContainer,
-};
+use crate::api_error::ApiError;
+use crate::auth::{AuthenticatedAdmin, AuthenticatedUser};
+use crate::config::Config;
+use crate::service::{KycRecord, KycService, KycStatus, PlanService};
 
-pub async fn create_app(
-    db_pool: Pool,
-    config: Config,
-) -> Result<Router, Box<dyn std::error::Error>> {
-    // Create service container
-    let services = Arc::new(ServiceContainer::new(db_pool, config.clone()).await?);
+pub struct AppState {
+    pub db: PgPool,
+    pub config: Config,
+}
 
-    // Health check routes
-    let health_routes = Router::new()
-        .route("/health", get(health::health_check))
-        .route("/ready", get(health::readiness_check));
+pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> {
+    let state = Arc::new(AppState { db, config });
 
-    // Auth routes
-    let auth_routes = Router::new()
-        .route("/login", post(auth::login))
-        .route("/register", post(auth::register))
-        .route("/refresh", post(auth::refresh_token));
-
-    // Identity & Wallet routes
-    let identity_routes = Router::new()
-        .route("/users", post(identity::create_user))
-        .route("/users/:user_id", get(identity::get_user))
-        .route("/users/:user_id/wallet", get(identity::get_wallet))
-        .route("/resolve/:user_id", get(identity::resolve_user_id));
-
-    // Payment routes
-    let payment_routes = Router::new()
-        .route("/payments", post(payments::create_payment))
-        .route("/payments/:id", get(payments::get_payment))
-        .route("/payments/:id/status", get(payments::get_payment_status))
-        .route("/qr/generate", post(payments::generate_qr))
-        .route("/nfc/validate", post(payments::validate_nfc));
-
-    // Transfer routes
-    let transfer_routes = Router::new()
-        .route("/transfers", post(transfers::create_transfer))
-        .route("/transfers/:id", get(transfers::get_transfer))
-        .route("/transfers/:id/status", get(transfers::get_transfer_status));
-
-    // Withdrawal routes
-    let withdrawal_routes = Router::new()
-        .route("/withdrawals", post(withdrawals::create_withdrawal))
-        .route("/withdrawals/:id", get(withdrawals::get_withdrawal))
-        .route("/withdrawals/:id/status", get(withdrawals::get_withdrawal_status));
-
-    let admin_routes = Router::new()
-        .route("/dashboard/stats", get(admin::get_dashboard_stats))
-        .route("/transactions", get(admin::get_transactions))
-        .route("/users/:user_id/activity", get(admin::get_user_activity))
-        .route("/system/health", get(admin::get_system_health))
-        .route("/kyc/:user_id", get(admin::get_kyc_status))
-        .route("/kyc/approve", post(admin::approve_kyc))
-        .route("/kyc/reject", post(admin::reject_kyc))
-        .layer(middleware::from_fn(auth_middleware::admin_only));
-
-    // Protected routes (require authentication)
-    let protected_routes = Router::new()
-        .nest("/identity", identity_routes)
-        .nest("/payments", payment_routes)
-        .nest("/transfers", transfer_routes)
-        .nest("/withdrawals", withdrawal_routes)
-        .nest("/admin", admin_routes)
-        .layer(middleware::from_fn(auth_middleware::authenticate));
-
-    // Public routes
-    let public_routes = Router::new()
-        .nest("/auth", auth_routes)
-        .nest("/health", health_routes);
-
-    // Combine all routes
     let app = Router::new()
-        .merge(public_routes)
-        .merge(protected_routes)
-        .layer(middleware::from_fn(request_id::request_id))
-        .layer(middleware::from_fn(metrics::track_metrics))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(services);
+        .route("/health", get(health_check))
+        .route("/health/db", get(db_health_check))
+        .route(
+            "/api/plans/due-for-claim/:plan_id",
+            get(get_due_for_claim_plan),
+        )
+        .route(
+            "/api/plans/due-for-claim",
+            get(get_all_due_for_claim_plans_user),
+        )
+        .route(
+            "/api/admin/plans/due-for-claim",
+            get(get_all_due_for_claim_plans_admin),
+        )
+        .route("/api/admin/kyc/:user_id", get(get_kyc_status))
+        .route("/api/admin/kyc/approve", post(approve_kyc))
+        .route("/api/admin/kyc/reject", post(reject_kyc))
+        .with_state(state);
+
 
     Ok(app)
+}
+
+async fn health_check() -> Json<Value> {
+    Json(json!({ "status": "ok", "message": "App is healthy" }))
+}
+
+async fn db_health_check(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<Value>, ApiError> {
+    sqlx::query("SELECT 1").execute(&state.db).await?;
+    Ok(Json(
+        json!({ "status": "ok", "message": "Database is connected" }),
+    ))
+}
+
+async fn get_due_for_claim_plan(
+    State(state): State<Arc<AppState>>,
+    Path(plan_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let plan = PlanService::get_due_for_claim_plan_by_id(&state.db, plan_id, user.user_id).await?;
+
+    match plan {
+        Some(plan) => Ok(Json(json!({
+            "status": "success",
+            "data": plan
+        }))),
+        None => Err(ApiError::NotFound(format!(
+            "Plan {} not found or not due for claim",
+            plan_id
+        ))),
+    }
+}
+
+async fn get_all_due_for_claim_plans_user(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let plans = PlanService::get_all_due_for_claim_plans_for_user(&state.db, user.user_id).await?;
+
+    Ok(Json(json!({
+        "status": "success",
+        "data": plans,
+        "count": plans.len()
+    })))
+}
+
+async fn get_all_due_for_claim_plans_admin(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+) -> Result<Json<Value>, ApiError> {
+    let plans = PlanService::get_all_due_for_claim_plans_admin(&state.db).await?;
+
+    Ok(Json(json!({
+        "status": "success",
+        "data": plans,
+        "count": plans.len()
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct KycUpdateRequest {
+    pub user_id: Uuid,
+}
+
+async fn get_kyc_status(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<KycRecord>, ApiError> {
+    let status = KycService::get_kyc_status(&state.db, user_id).await?;
+    Ok(Json(status))
+}
+
+async fn approve_kyc(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(admin): AuthenticatedAdmin,
+    Json(payload): Json<KycUpdateRequest>,
+) -> Result<Json<KycRecord>, ApiError> {
+    let status = KycService::update_kyc_status(
+        &state.db,
+        admin.admin_id,
+        payload.user_id,
+        KycStatus::Approved,
+    )
+    .await?;
+    Ok(Json(status))
+}
+
+async fn reject_kyc(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(admin): AuthenticatedAdmin,
+    Json(payload): Json<KycUpdateRequest>,
+) -> Result<Json<KycRecord>, ApiError> {
+    let status = KycService::update_kyc_status(
+        &state.db,
+        admin.admin_id,
+        payload.user_id,
+        KycStatus::Rejected,
+    )
+    .await?;
+    Ok(Json(status))
 }

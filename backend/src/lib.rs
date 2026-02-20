@@ -3,10 +3,7 @@ pub mod app;
 pub mod auth;
 pub mod config;
 pub mod db;
-pub mod http;
 pub mod middleware;
-pub mod models;
-// pub mod realtime; // TODO: Implement when needed
 pub mod service;
 pub mod telemetry;
 

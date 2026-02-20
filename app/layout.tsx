@@ -1,6 +1,11 @@
 import type { Metadata, Viewport } from "next";
 import { Outfit, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { WalletProvider } from "@/context/WalletContext";
+import { AdminAuthProvider } from "@/context/AdminAuthContext";
+import { KYCProvider } from "@/context/KYCContext";
+import { WalletModal } from "@/components/WalletModal";
+import { KYCVerificationModal } from "@/components/KYCVerificationModal";
 
 const outfit = Outfit({
   variable: "--font-outfit",
@@ -73,6 +78,12 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // We need to import these dynamically or ensure "use client" wraps them if passing context
+  // But Layout is a Server Component by default in Next.js App Router.
+  // We cannot use Context directly in a Server Component layout.
+  // So we need a "Providers" client component or assume WalletProvider is "use client".
+  // WalletProvider IS "use client".
+
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
@@ -90,7 +101,15 @@ export default function RootLayout({
         className={`${outfit.variable} ${geistMono.variable} antialiased`}
         suppressHydrationWarning
       >
-        {children}
+        <AdminAuthProvider>
+          <WalletProvider>
+            <KYCProvider>
+              <main className="">{children}</main>
+              <WalletModal />
+              <KYCVerificationModal />
+            </KYCProvider>
+          </WalletProvider>
+        </AdminAuthProvider>
       </body>
     </html>
   );
